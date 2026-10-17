@@ -2,50 +2,57 @@ import {
   findDestinationVariantByBarcode,
   getDestination,
   setDestinationAvailableQuantity,
+  type DestinationConfig,
   type DestinationName,
 } from "./stores.server";
+import { log, logError, logWarn } from "./logger.server";
 
 const DESTINATIONS: DestinationName[] = ["belwari", "keno"];
 
-export async function syncInventoryToDestinations(params: {
+interface InventorySyncParams {
   barcode?: string | null;
   quantity: number;
-}): Promise<void> {
-  const { barcode, quantity } = params;
+}
 
-  if (!barcode?.trim()) {
-    console.warn(
-      "[inventory] source item has no barcode; skipping (barcode is the match key)",
-    );
+interface DestinationInventoryParams {
+  barcode: string;
+  quantity: number;
+}
+
+export async function syncInventoryToDestinations(
+  params: InventorySyncParams,
+): Promise<void> {
+  const barcode = params.barcode?.trim();
+
+  if (!barcode) {
+    logWarn("inventory", "source item has no barcode; skipping", {
+      reason: "barcode is the match key",
+    });
     return;
   }
+
+  log("inventory", "syncing quantity", { barcode, quantity: params.quantity });
 
   const failures: string[] = [];
 
   for (const name of DESTINATIONS) {
     const destination = getDestination(name);
+
     if (!destination) {
-      console.warn(`[inventory] destination "${name}" is not configured; skipping`);
+      logWarn("inventory", "destination not configured; skipping", {
+        destination: name,
+      });
       continue;
     }
 
     try {
-      const variant = await findDestinationVariantByBarcode(destination, barcode);
-
-      if (!variant) {
-        console.warn(
-          `[inventory] no ${name} variant matched barcode="${barcode}"; skipping (never creates)`,
-        );
-        continue;
-      }
-
-      await setDestinationAvailableQuantity(
-        destination,
-        variant.inventoryItemId,
-        quantity,
-      );
-      console.log(`[inventory] set ${name} available=${quantity} (barcode="${barcode}")`);
+      await syncToDestination(destination, { barcode, quantity: params.quantity });
     } catch (error) {
+      logError("inventory", "destination sync failed", {
+        destination: name,
+        barcode,
+        error: String(error),
+      });
       failures.push(`${name}: ${String(error)}`);
     }
   }
@@ -53,4 +60,33 @@ export async function syncInventoryToDestinations(params: {
   if (failures.length > 0) {
     throw new Error(`inventory sync failed for ${failures.join("; ")}`);
   }
+}
+
+async function syncToDestination(
+  destination: DestinationConfig,
+  params: DestinationInventoryParams,
+): Promise<void> {
+  const { barcode, quantity } = params;
+
+  const variant = await findDestinationVariantByBarcode(destination, barcode);
+
+  if (!variant) {
+    logWarn("inventory", "no variant matched barcode; skipping (never creates)", {
+      destination: destination.name,
+      barcode,
+    });
+    return;
+  }
+
+  await setDestinationAvailableQuantity(
+    destination,
+    variant.inventoryItemId,
+    quantity,
+  );
+
+  log("inventory", "set available quantity", {
+    destination: destination.name,
+    barcode,
+    quantity,
+  });
 }

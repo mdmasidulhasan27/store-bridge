@@ -1,10 +1,19 @@
+import { randomUUID } from "node:crypto";
+
+import { log, logError, logWarn } from "./logger.server";
+
 export type DestinationName = "belwari" | "keno";
 
-interface DestinationConfig {
+export interface DestinationConfig {
   name: DestinationName;
   shop: string;
   clientId: string;
   clientSecret: string;
+}
+
+export interface DestinationProduct {
+  id: string;
+  variants: { barcode: string | null; inventoryItemId: string | null }[];
 }
 
 const API_VERSION = "2026-07";
@@ -28,7 +37,7 @@ export function getDestination(name: DestinationName): DestinationConfig | null 
 }
 
 const tokenCache = new Map<DestinationName, { token: string; expiresAt: number }>();
-const locationCache = new Map<DestinationName, string>();
+const locationCache = new Map<DestinationName, string[]>();
 
 async function getToken(destination: DestinationConfig): Promise<string> {
   const cached = tokenCache.get(destination.name);
@@ -65,14 +74,26 @@ async function getToken(destination: DestinationConfig): Promise<string> {
     expiresAt: Date.now() + expires_in * 1000,
   });
 
+  log("destination", "refreshed access token", {
+    destination: destination.name,
+    shop: destination.shop,
+  });
+
   return access_token;
 }
 
 async function destinationGraphql<T = unknown>(
   destination: DestinationConfig,
+  operation: string,
   query: string,
   variables: Record<string, unknown> = {},
 ): Promise<T> {
+  log("api", "sending request", {
+    destination: destination.name,
+    operation,
+  });
+
+  const startedAt = Date.now();
   const response = await fetch(
     `https://${destination.shop}/admin/api/${API_VERSION}/graphql.json`,
     {
@@ -84,13 +105,24 @@ async function destinationGraphql<T = unknown>(
       body: JSON.stringify({ query, variables }),
     },
   );
+  const durationMs = Date.now() - startedAt;
 
   if (response.status === 401 || response.status === 403) {
     tokenCache.delete(destination.name);
+    logWarn("destination", "unauthorized; cleared cached token", {
+      destination: destination.name,
+      status: response.status,
+    });
     throw new Error(`${destination.name}: GraphQL unauthorized (${response.status})`);
   }
 
   if (!response.ok) {
+    logError("api", "request failed", {
+      destination: destination.name,
+      operation,
+      status: response.status,
+      ms: durationMs,
+    });
     throw new Error(
       `${destination.name}: GraphQL request failed (${response.status})`,
     );
@@ -102,6 +134,11 @@ async function destinationGraphql<T = unknown>(
   };
 
   if (json.errors?.length) {
+    logError("api", "request returned errors", {
+      destination: destination.name,
+      operation,
+      errors: json.errors.map((error) => error.message).join("; "),
+    });
     throw new Error(
       `${destination.name}: GraphQL errors: ${JSON.stringify(json.errors)}`,
     );
@@ -110,6 +147,13 @@ async function destinationGraphql<T = unknown>(
   if (!json.data) {
     throw new Error(`${destination.name}: GraphQL response contained no data`);
   }
+
+  log("api", "received response", {
+    destination: destination.name,
+    operation,
+    status: response.status,
+    ms: durationMs,
+  });
 
   return json.data;
 }
@@ -126,6 +170,7 @@ export async function findDestinationProductIdBySku(
     productVariants: { nodes: { product: { id: string } }[] };
   }>(
     destination,
+    "findProductIdBySku",
     `#graphql
       query FindProductBySku($query: String!) {
         productVariants(first: 1, query: $query) {
@@ -146,19 +191,33 @@ export async function upsertDestinationProduct(
   destination: DestinationConfig,
   input: Record<string, unknown>,
   identifier?: Record<string, unknown>,
-): Promise<{ id: string } | null> {
+): Promise<DestinationProduct | null> {
   const data = await destinationGraphql<{
     productSet: {
-      product: { id: string } | null;
+      product: {
+        id: string;
+        variants: {
+          nodes: { barcode: string | null; inventoryItem: { id: string } | null }[];
+        };
+      } | null;
       userErrors: { field: string[] | null; message: string }[];
     };
   }>(
     destination,
+    "productSet",
     `#graphql
       mutation UpsertProduct($input: ProductSetInput!, $identifier: ProductSetIdentifiers) {
         productSet(input: $input, identifier: $identifier) {
           product {
             id
+            variants(first: 100) {
+              nodes {
+                barcode
+                inventoryItem {
+                  id
+                }
+              }
+            }
           }
           userErrors {
             field
@@ -175,7 +234,18 @@ export async function upsertDestinationProduct(
     );
   }
 
-  return data.productSet.product;
+  const product = data.productSet.product;
+  if (!product) {
+    return null;
+  }
+
+  return {
+    id: product.id,
+    variants: product.variants.nodes.map((node) => ({
+      barcode: node.barcode,
+      inventoryItemId: node.inventoryItem?.id ?? null,
+    })),
+  };
 }
 
 export async function findDestinationVariantByBarcode(
@@ -188,6 +258,7 @@ export async function findDestinationVariantByBarcode(
     };
   }>(
     destination,
+    "findVariantByBarcode",
     `#graphql
       query FindVariantByBarcode($query: String!) {
         productVariants(first: 1, query: $query) {
@@ -210,34 +281,112 @@ export async function findDestinationVariantByBarcode(
   return { variantId: node.id, inventoryItemId: node.inventoryItem.id };
 }
 
-async function getDestinationLocationId(
+interface LocationsPage {
+  locations: {
+    nodes: { id: string }[];
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  };
+}
+
+function fetchLocationsPage(
   destination: DestinationConfig,
-): Promise<string | null> {
+  cursor: string | null,
+): Promise<LocationsPage> {
+  return destinationGraphql<LocationsPage>(
+    destination,
+    "locations",
+    `#graphql
+      query AllLocations($cursor: String) {
+        locations(first: 100, after: $cursor) {
+          nodes {
+            id
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }`,
+    { cursor },
+  );
+}
+
+async function getDestinationLocationIds(
+  destination: DestinationConfig,
+): Promise<string[]> {
   const cached = locationCache.get(destination.name);
   if (cached) {
     return cached;
   }
 
+  const locationIds: string[] = [];
+  let cursor: string | null = null;
+
+  do {
+    const data = await fetchLocationsPage(destination, cursor);
+
+    locationIds.push(...data.locations.nodes.map((node) => node.id));
+    cursor = data.locations.pageInfo.hasNextPage
+      ? data.locations.pageInfo.endCursor
+      : null;
+  } while (cursor);
+
+  locationCache.set(destination.name, locationIds);
+  log("destination", "loaded locations", {
+    destination: destination.name,
+    count: locationIds.length,
+  });
+  return locationIds;
+}
+
+async function stockInventoryItemAtLocations(
+  destination: DestinationConfig,
+  inventoryItemId: string,
+  locationIds: string[],
+): Promise<void> {
   const data = await destinationGraphql<{
-    locations: { nodes: { id: string }[] };
+    inventoryBulkToggleActivation: {
+      userErrors: { code: string | null; field: string[] | null; message: string }[];
+    };
   }>(
     destination,
+    "inventoryBulkToggleActivation",
     `#graphql
-      query PrimaryLocation {
-        locations(first: 1) {
-          nodes {
-            id
+      mutation StockInventoryItem($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!, $idempotencyKey: String!) {
+        inventoryBulkToggleActivation(
+          inventoryItemId: $inventoryItemId
+          inventoryItemUpdates: $inventoryItemUpdates
+        ) @idempotent(key: $idempotencyKey) {
+          userErrors {
+            code
+            field
+            message
           }
         }
       }`,
+    {
+      inventoryItemId,
+      inventoryItemUpdates: locationIds.map((locationId) => ({
+        locationId,
+        activate: true,
+      })),
+      idempotencyKey: randomUUID(),
+    },
   );
 
-  const locationId = data.locations.nodes[0]?.id ?? null;
-  if (locationId) {
-    locationCache.set(destination.name, locationId);
+  const errors = data.inventoryBulkToggleActivation.userErrors;
+  if (errors.length > 0) {
+    throw new Error(
+      `${destination.name}: inventoryBulkToggleActivation failed: ${JSON.stringify(
+        errors,
+      )}`,
+    );
   }
 
-  return locationId;
+  log("destination", "stocked item at all locations", {
+    destination: destination.name,
+    locations: locationIds.length,
+  });
 }
 
 export async function setDestinationAvailableQuantity(
@@ -245,10 +394,12 @@ export async function setDestinationAvailableQuantity(
   inventoryItemId: string,
   quantity: number,
 ): Promise<void> {
-  const locationId = await getDestinationLocationId(destination);
-  if (!locationId) {
-    throw new Error(`${destination.name}: no location found for inventory sync`);
+  const locationIds = await getDestinationLocationIds(destination);
+  if (locationIds.length === 0) {
+    throw new Error(`${destination.name}: no locations found for inventory sync`);
   }
+
+  await stockInventoryItemAtLocations(destination, inventoryItemId, locationIds);
 
   const data = await destinationGraphql<{
     inventorySetQuantities: {
@@ -256,9 +407,10 @@ export async function setDestinationAvailableQuantity(
     };
   }>(
     destination,
+    "inventorySetQuantities",
     `#graphql
-      mutation SetAvailableQuantity($input: InventorySetQuantitiesInput!) {
-        inventorySetQuantities(input: $input) {
+      mutation SetAvailableQuantity($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+        inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
           userErrors {
             code
             field
@@ -270,8 +422,14 @@ export async function setDestinationAvailableQuantity(
       input: {
         name: "available",
         reason: "correction",
-        quantities: [{ inventoryItemId, locationId, quantity }],
+        quantities: locationIds.map((locationId) => ({
+          inventoryItemId,
+          locationId,
+          quantity,
+          changeFromQuantity: null,
+        })),
       },
+      idempotencyKey: randomUUID(),
     },
   );
 
@@ -281,5 +439,78 @@ export async function setDestinationAvailableQuantity(
         data.inventorySetQuantities.userErrors,
       )}`,
     );
+  }
+}
+
+/** Resolves destination collection ids by handle. Handles not present are skipped. */
+export async function findDestinationCollectionIds(
+  destination: DestinationConfig,
+  handles: string[],
+): Promise<string[]> {
+  const collectionIds: string[] = [];
+
+  for (const handle of handles) {
+    const data = await destinationGraphql<{
+      collections: { nodes: { id: string }[] };
+    }>(
+      destination,
+      "collectionsByHandle",
+      `#graphql
+        query CollectionsByHandle($query: String!) {
+          collections(first: 1, query: $query) {
+            nodes {
+              id
+            }
+          }
+        }`,
+      { query: `handle:"${escapeSearchTerm(handle)}"` },
+    );
+
+    const collectionId = data.collections.nodes[0]?.id;
+    if (collectionId) {
+      collectionIds.push(collectionId);
+    } else {
+      logWarn("destination", "collection not found by handle; skipping", {
+        destination: destination.name,
+        handle,
+      });
+    }
+  }
+
+  return collectionIds;
+}
+
+export async function addProductToCollections(
+  destination: DestinationConfig,
+  productId: string,
+  collectionIds: string[],
+): Promise<void> {
+  for (const collectionId of collectionIds) {
+    const data = await destinationGraphql<{
+      collectionAddProducts: {
+        userErrors: { field: string[] | null; message: string }[];
+      };
+    }>(
+      destination,
+      "collectionAddProducts",
+      `#graphql
+        mutation AddProductToCollection($id: ID!, $productIds: [ID!]!) {
+          collectionAddProducts(id: $id, productIds: $productIds) {
+            userErrors {
+              field
+              message
+            }
+          }
+        }`,
+      { id: collectionId, productIds: [productId] },
+    );
+
+    if (data.collectionAddProducts.userErrors.length > 0) {
+      throw new Error(
+        `${destination.name}: collectionAddProducts failed: ${JSON.stringify(
+          data.collectionAddProducts.userErrors,
+        )}`,
+      );
+    }
   }
 }
