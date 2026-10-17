@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__shopify-dev-mcp__validate",
+      "mcp__shopify-dev-mcp__search_docs_chunks"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}
