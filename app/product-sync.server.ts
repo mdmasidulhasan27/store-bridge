@@ -492,25 +492,9 @@ export async function syncProductToDestination(
     mode === "update" ? LOOKUP_ATTEMPTS : 1,
   );
 
-  log(
-    "products",
-    existingProductId
-      ? "matched destination product"
-      : "no matching destination product",
-    {
-      sku,
-      destination: destinationName,
-      destinationProduct: existingProductId ?? "(none)",
-    },
+  log("products", existingProductId ? "matched destination product" : "no matching destination product",
+    {sku, destination: destinationName, destinationProduct: existingProductId ?? "(none)",},
   );
-
-  if (!existingProductId && mode === "update") {
-    logWarn("products", "update skipped; this mode never creates", {
-      product: product.id,
-      sku,
-    });
-    return { destination: destinationName, action: "skipped", productId: null };
-  }
 
   const input = buildProductSetInput(product, extras);
   const synced = await upsertDestinationProduct(

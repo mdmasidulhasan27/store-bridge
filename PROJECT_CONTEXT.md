@@ -12,8 +12,8 @@ _Last updated: 2026-10-17. Read this first when resuming on another machine._
 
 **Sync rules**
 - **Product identity = variant SKU.** No SKU in the source → skip.
-  - Create event: SKU missing in destination → create; SKU present → update.
-  - Update event: SKU missing in destination → skip (never creates); SKU present → update the full product.
+  - SKU missing in destination → **create**; SKU present → update the full product.
+  - `products/create` and `products/update` behave the same: an **update also creates** when the SKU isn't in the destination.
 - Product **created/updated** in Blucheez → destination chosen by `vendor`:
   - `vendor == "belwari"` → push to **Belwari** (case-insensitive, trimmed)
   - any other vendor → push to **Keno**
@@ -56,7 +56,7 @@ Also provided at runtime by the Shopify CLI / host (not in `.env`): `SHOPIFY_API
 | File | Responsibility |
 | --- | --- |
 | `app/stores.server.ts` | Per-destination Shopify Admin client. Client-credentials token (in-memory cache, 24h, 60s early expiry), `destinationGraphql` (401/403 clears token), `findDestinationProductIdBySku`, `upsertDestinationProduct` (`productSet`), `findDestinationVariantByBarcode`, `getDestinationLocationIds` (**all** locations, paginated, cached), `stockInventoryItemAtLocations` (`inventoryBulkToggleActivation`, activates the item at every location), `setDestinationAvailableQuantity` (`inventorySetQuantities` across **all** locations). Search terms are escaped (`escapeSearchTerm`). |
-| `app/product-sync.server.ts` | `destinationForVendor` routing (belwari→belwari, else→keno), webhook-payload → `ProductSetInput` mapping (`STATUS_MAP`, `normalizeTags`, `buildOptionValues`, `buildVariantInput`, `buildProductOptions`, `buildImageFiles`), `syncProductToDestination(product, "create" \| "update", extras?)` — matched by **SKU**; create mode creates when absent, update mode only ever updates; no SKU → skip. Merges `SourceProductExtras` (SEO, metafields, variant cost/origin) into the `productSet` input. After `productSet`, `setDestinationQuantities` sets each barcode-bearing variant's `inventory_quantity` at all routed-destination locations using inventory item ids from the response (no barcode re-query) and `syncCollections` adds the product to handle-matched collections. Update mode retries the SKU lookup 3× (800ms apart) so a racing create isn't dropped. |
+| `app/product-sync.server.ts` | `destinationForVendor` routing (belwari→belwari, else→keno), webhook-payload → `ProductSetInput` mapping (`STATUS_MAP`, `normalizeTags`, `buildOptionValues`, `buildVariantInput`, `buildProductOptions`, `buildImageFiles`), `syncProductToDestination(product, "create" \| "update", extras?)` — matched by **SKU**; creates when the SKU is absent, updates when present; no SKU → skip. Merges `SourceProductExtras` (SEO, metafields, variant cost/origin) into the `productSet` input. After `productSet`, `setDestinationQuantities` sets each barcode-bearing variant's `inventory_quantity` at all routed-destination locations using inventory item ids from the response (no barcode re-query) and `syncCollections` adds the product to handle-matched collections. Update mode retries the SKU lookup 3× (800ms apart) so a racing create isn't dropped. |
 | `app/source-product.server.ts` | Reads the deeper/authoritative fields the product webhook may not carry from the **source** store via `admin.graphql`: `seo`, `media` images, product/variant metafields, variant `inventoryItem` (`tracked`, `unitCost`, country of origin, HS code) and collection handles. Skips `$app`-namespace and reference-type metafields. |
 | `app/inventory-sync.server.ts` | `syncInventoryToDestinations` — broadcasts absolute available qty to **every location** of both stores; matches variant by **barcode only** and **never creates products** (skips if no barcode or no match); aggregates errors and throws if any destination failed. |
 | `app/logger.server.ts` | Tiny logging helper — `log` / `logWarn` / `logError` emit one `[storebridge:<scope>] message key=value` line so a sync can be traced end-to-end. |
@@ -175,9 +175,9 @@ npm run deploy              # shopify app deploy — REQUIRED after shopify.app.
 - Destination edits are overwritten on the next Blucheez update — intentional one-way mirror.
 - Stock is mirrored to **every** location of each destination. On product create/update the quantity is set right after `productSet` (item ids from its response) via activate → `inventorySetQuantities`; the inventory webhook does the same after a barcode lookup. If activation fails at a location (e.g. the item is managed by a third-party fulfillment service, or the variant has no SKU — `MISSING_SKU`), that sync for the destination throws and returns 500.
 - Product identity is **SKU**; stock identity is **barcode**. A missing source key → skip. Stock never creates products. Neither SKU nor barcode is unique in Shopify, so shared values can mis-match.
+- **Update creates on a SKU miss** (changed 2026-10-17). Because `products/create` and `products/update` can arrive together, two events can both create a product with the same SKU in the destination. The update-mode SKU-lookup retry (3× / 800ms) reduces but can't fully prevent duplicates.
 - If a destination API call fails during stock broadcast, the other still runs and the webhook returns 500 so Shopify retries (upsert/set are idempotent).
 - Webhook-triggered inventory sync needs the source `admin` session; CLI-triggered webhooks (fake shop) have none and will be skipped by design.
-- Minor: the products webhook log line prints `products/${topic}` where `topic` is already `products/create`, so logs read `products/products/create`.
 
 ## Possible next steps
 
