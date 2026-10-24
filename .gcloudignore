@@ -1,0 +1,26 @@
+# Uploaded when running `gcloud run deploy --source .`.
+# gcloud would otherwise fall back to .gitignore; keeping this explicit means the
+# build context can never contain .env, the local database, or build output.
+# Do NOT add Dockerfile, start.sh, or prisma/schema.prod.prisma to this list.
+
+.git
+.github
+.gcloudignore
+.dockerignore
+node_modules
+build
+.cache
+.react-router
+.shopify
+.shopify.lock
+.commandcode
+.cursor
+.gemini
+.idea
+.env
+.env.*
+*.log
+prisma/dev.sqlite
+prisma/dev.sqlite-journal
+public/build
+app/build

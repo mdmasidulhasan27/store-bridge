@@ -1,6 +1,6 @@
 # StoreBridge — Project Context / Handoff
 
-_Last updated: 2026-10-17. Read this first when resuming on another machine._
+_Last updated: 2026-10-24. Read this first when resuming on another machine._
 
 ## What this is
 
@@ -27,6 +27,7 @@ _Last updated: 2026-10-17. Read this first when resuming on another machine._
 - Admin API version: **2026-07** (`ApiVersion.July26` in `app/shopify.server.ts`; also the `API_VERSION` constant in `app/stores.server.ts`).
 - `shopify.app.toml`: `embedded = false`; webhook `api_version = "2026-10"` (one version ahead of the Admin API client — the payload mapping is REST-shaped webhook JSON, unaffected).
 - Node >= 22.12, pnpm workspaces (`extensions/` is empty, only `.gitkeep`).
+- **Production runs on Google Cloud Run + Cloud SQL for PostgreSQL** (region `asia-south1`). Local development keeps the SQLite datasource — see [Deployment](#deployment-google-cloud-run).
 - **Use the Shopify AI Toolkit (Shopify Dev MCP) for any Shopify API/platform work.** See `AGENTS.md`.
 
 ## Environment variables
@@ -71,6 +72,11 @@ Also provided at runtime by the Shopify CLI / host (not in `.env`): `SHOPIFY_API
 | `shopify.app.toml` | App config + **webhook subscriptions**: `app/uninstalled`, `app/scopes_update`, `products/create`, `products/update`, `inventory_levels/update`. |
 | `prisma/schema.prisma` | SQLite datasource + `Session` model (includes `refreshToken` / `refreshTokenExpires`). |
 | `run.sh` | `shopify app dev` (one-line convenience). |
+| `prisma/schema.prod.prisma` | Postgres mirror of `schema.prisma` — only the datasource differs. Copied over `schema.prisma` by the image build; local dev never uses it. |
+| `Dockerfile` | Production image: `node:22-alpine` + Cloud SQL Auth Proxy; swaps in the Postgres schema, drops the SQLite migrations, `prisma generate`, then `react-router build`. |
+| `start.sh` | Cloud Run entrypoint: starts the proxy, `npm run setup:prod`, then `exec npm run start` so Node is PID 1. |
+| `deploy.sh` | One-shot `gcloud run deploy --source .` with region, secrets, Cloud SQL and scaling flags. |
+| `.gcloudignore` / `.dockerignore` | Keep `.env`, the local SQLite file and build output out of the build context and the image. |
 
 ## Logging
 
@@ -151,9 +157,85 @@ Deploy config/webhooks:
 npm run deploy              # shopify app deploy — REQUIRED after shopify.app.toml changes
 ```
 
+## Deployment (Google Cloud Run)
+
+Production target: **Cloud Run** (`storebridge`, region `asia-south1`/Mumbai — nearest supported region to Bangladesh) with **Cloud SQL for PostgreSQL 15** (`storebridge-db`, database `shopify_app`). Follows Shopify's [Cloud Run guide](https://shopify.dev/docs/apps/launch/deployment/deploy-to-google-cloud-run) with two deltas: `prisma generate` runs at **image build** time (not container start), and the region is `asia-south1`.
+
+**Why Postgres:** `prisma/schema.prisma` hardcodes `url = "file:dev.sqlite"`. On Cloud Run every new revision gets an empty disk, so sessions would be lost and every deployment would force a re-install. The image therefore swaps in `prisma/schema.prod.prisma`; the SQLite `prisma/migrations/` are removed from the image (its DDL cannot run on Postgres) and the schema is created with `prisma db push --skip-generate` at container start.
+
+**Secrets** (Secret Manager → Cloud Run env vars, never in the image):
+
+| Secret | Env var |
+| --- | --- |
+| `shopify-api-key` | `SHOPIFY_API_KEY` |
+| `shopify-api-secret` | `SHOPIFY_API_SECRET` |
+| `database-url` | `DATABASE_URL` (`postgresql://postgres:<pw>@localhost:5432/shopify_app`) |
+| `belwari-shop`, `belwari-client-id`, `belwari-client-secret` | `BELWARI_*` |
+| `keno-shop`, `keno-client-id`, `keno-client-secret` | `KENO_*` — **not created yet**; see caveats |
+
+Plain env vars: `SCOPES`, `SHOPIFY_APP_URL`, `INSTANCE_CONNECTION_NAME`.
+
+**One-time setup** (install the [Cloud CLI](https://cloud.google.com/sdk/docs/install) first — `gcloud` is not on this machine):
+```bash
+export PROJECT_ID="storebridge-prod"        # must be globally unique
+export SERVICE_REGION="asia-south1"
+
+gcloud projects create "$PROJECT_ID" && gcloud config set project "$PROJECT_ID"
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  secretmanager.googleapis.com artifactregistry.googleapis.com sqladmin.googleapis.com
+
+eval "$(shopify app info --web-env)"        # exports SHOPIFY_API_KEY / SHOPIFY_API_SECRET / SCOPES
+
+# Secrets (values for BELWARI_* come from .env)
+printf '%s' "$SHOPIFY_API_KEY"    | gcloud secrets create shopify-api-key    --data-file=-
+printf '%s' "$SHOPIFY_API_SECRET" | gcloud secrets create shopify-api-secret --data-file=-
+printf '%s' "<belwari shop>"      | gcloud secrets create belwari-shop          --data-file=-
+printf '%s' "<belwari client id>" | gcloud secrets create belwari-client-id     --data-file=-
+printf '%s' "<belwari secret>"    | gcloud secrets create belwari-client-secret --data-file=-
+
+# Cloud SQL
+export DB_PASSWORD="<strong password>"
+gcloud sql instances create storebridge-db --database-version=POSTGRES_15 \
+  --tier=db-f1-micro --region="$SERVICE_REGION" --root-password="$DB_PASSWORD"
+gcloud sql databases create shopify_app --instance=storebridge-db
+printf '%s' "postgresql://postgres:${DB_PASSWORD}@localhost:5432/shopify_app" \
+  | gcloud secrets create database-url --data-file=-
+
+# Runtime service account permissions
+export RUNTIME_SA="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/secretmanager.secretAccessor
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/cloudsql.client
+```
+
+**Deploy:**
+```bash
+PROJECT_ID=$PROJECT_ID SERVICE_REGION=$SERVICE_REGION \
+INSTANCE_CONNECTION_NAME="<project>:asia-south1:storebridge-db" \
+SCOPES="$SCOPES" SHOPIFY_APP_URL="https://placeholder.invalid" ./deploy.sh
+
+# SHOPIFY_APP_URL is unknowable until the service exists: the first run creates it
+# (and the container fails to start), then read the real URL and deploy again.
+SHOPIFY_APP_URL=$(gcloud run services list --filter="metadata.name:storebridge" --format='get(URL)')
+```
+
+Then set `application_url` in `shopify.app.toml` to that URL and run `npm run deploy` so the app config and the five webhook subscriptions point at the deployment.
+
+**Runtime flags** (`deploy.sh`): `--min-instances 1` (the sync path is fully sequential, so a cold start risks Shopify's retry window), `--max-instances 3` (limits how many separate in-memory `tokenCache` / `locationCache` maps exist in `app/stores.server.ts`), `--memory 1Gi`, `--timeout 300`, `--allow-unauthenticated` (Shopify must reach the webhooks).
+
+**Verify:**
+```bash
+gcloud run services logs read storebridge --region asia-south1 --limit 100   # proxy, db push, [storebridge:*] lines
+gcloud sql connect storebridge-db --database=shopify_app                      # SELECT count(*) FROM "Session";
+```
+
 ## Status as of this session
 
 - `typecheck`, `lint` pass.
+- **GCP deployment prepared (2026-10-24)**: `prisma/schema.prod.prisma`, `Dockerfile` (Cloud SQL proxy + build-time `prisma generate`), `start.sh`, `deploy.sh`, `.gcloudignore`, hardened `.dockerignore`, `setup:prod` script. The `docker-start` script was removed (the Dockerfile now runs `start.sh`). `typecheck`, `lint` and `prisma validate` are clean, and `prisma generate` against `schema.prod.prisma` succeeds. The image is now built and verified by Cloud Build (`gcloud run deploy --source .`), so the local Docker daemon is not needed for deploys.
+- **Deployed to Cloud Run (2026-10-24)**: service `storebridge` in project `store-bridge` (region `asia-south1`), revision `storebridge-00002-hjv`, at <https://storebridge-463178614843.asia-south1.run.app>. gcloud 590.0.1 installed user-local in `~/google-cloud-sdk`, authenticated as `blucheez.bd@gmail.com`. Startup verified end to end: Cloud SQL proxy up, `prisma db push` synced the Postgres schema in 236 ms, `GET /` returns 200. Shopify app version `storebridge-2` released with `application_url` pointing at the service and all five webhook subscriptions.
+- **Not verified end to end against live stores yet** — no product/stock sync has run through the deployed app, because that needs the app installed and exercised on the real source store.
 - Product sync (vendor-routed, SKU-matched) and inventory broadcast implemented and pushed (last commit 2026-10-11).
 - **Stock sync reworked (2026-10-17)** to mirror to **all** destination locations, and to supply the fields the 2026-07 schema requires (`changeFromQuantity: null`, `@idempotent` key). Not yet re-verified against live stores.
 - **Product sync sets inventory (2026-10-17)**: barcode-bearing variants get `inventory_quantity` set at all routed-destination locations, using the inventory item ids returned by `productSet` (no barcode re-query, so no post-create race). Update mode retries the SKU lookup 3× to survive a racing create. Logs carry `req=<id>` on a single stdout stream, and the `api` scope records every destination send/receive.
@@ -178,9 +260,18 @@ npm run deploy              # shopify app deploy — REQUIRED after shopify.app.
 - **Update creates on a SKU miss** (changed 2026-10-17). Because `products/create` and `products/update` can arrive together, two events can both create a product with the same SKU in the destination. The update-mode SKU-lookup retry (3× / 800ms) reduces but can't fully prevent duplicates.
 - If a destination API call fails during stock broadcast, the other still runs and the webhook returns 500 so Shopify retries (upsert/set are idempotent).
 - Webhook-triggered inventory sync needs the source `admin` session; CLI-triggered webhooks (fake shop) have none and will be skipped by design.
+- **Deployment: `prisma db push --skip-generate` runs on every container start.** Harmless and self-healing for an additive schema, but it is why `--min-instances 1` matters — with scale-to-zero the first request after idle pays proxy startup plus the schema sync before the server listens, which risks Shopify's retry window. Move it to a one-time step (a Cloud Run Job, or a local proxy session) if the always-on instance becomes a cost concern. `db push` refuses destructive changes non-interactively, so an incompatible `Session` change needs a manual table recreate.
+- **Deployment: `prisma/migrations/` is discarded in the image**, so the SQLite migration history does not apply to Postgres. Nothing in the app depends on migration history; Postgres schema state is owned by `db push`.
+- **Deployment: Keno stays unconfigured** until `keno-*` secrets exist and are appended to `deploy.sh`'s `--set-secrets` — same behaviour as local (`getDestination()` → `null` → warning + skip + HTTP 200). Watch out that `--set-secrets` referencing a secret that does not exist fails the whole deploy.
+- **Deployment: `AppDistribution.AppStore`** is set in `app/shopify.server.ts`. Fine for testing on the Blucheez dev store; App Store distribution needs review before real merchants can install. Switch to `AppDistribution.SingleMerchant` if the app is only ever meant for these three stores.
+- **Deployment: highest-latency hop is Shopify → Mumbai** (Shopify's webhook egress is US-based). Webhooks are async so this is tolerable; `asia-south1` keeps the outbound Admin API calls to all three stores fast. `asia-southeast1` is the fallback if a service is unavailable in Mumbai.
+- **Login form on `/` needed `?index` (fixed 2026-10-24)**: React Router's `getTargetMatch` drops pathless index routes from the action target unless the URL carries a naked `?index`, so the template's `<Form method="post">` in `app/routes/_index/route.tsx` posted to `/` and returned **405** (`You made a POST request to "/" but did not provide an action for route "root"`). The form now sets `action="?index"`, which reaches the action and redirects to the Shopify install URL. The install path Shopify itself uses — `GET /?shop=<store>` → 302 → `/app` — was never affected, so this only ever broke the manual fallback. Reproduced identically on a local production build, i.e. it was **not** caused by the Cloud Run deployment.
+- **`GET /app` returns 410 until the app is installed** on that shop — that is the Shopify library's "not installed" response, expected against a fresh (empty) `Session` table.
 
 ## Possible next steps
 
+- **Run the first live end-to-end test through the deployed app**: install it on the source store, then create/update a `belwari` vendor product, update another-vendor product, and change stock.
+- **Redeploy** with `./deploy.sh` (see [Deployment](#deployment-google-cloud-run)) after any code change — `npm run deploy` is separate and only pushes app config/webhooks.
 - Fill in `KENO_*` and run an end-to-end test (create/update a `belwari` vendor product → Belwari; another vendor → Keno; change stock → both).
 - Admin health page showing each destination's configured status / token check.
 - Consider async `productSet` (`synchronous: false`) if large products time out.

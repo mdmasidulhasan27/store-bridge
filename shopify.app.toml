@@ -2,7 +2,7 @@
 
 client_id = "ee4e4e1125f0045461d23f2e0cfcbf77"
 name = "StoreBridge"
-application_url = "https://shopify.dev/apps/default-app-home"
+application_url = "https://storebridge-463178614843.asia-south1.run.app"
 embedded = false
 
 [access_scopes]
@@ -62,5 +62,4 @@ api_version = "2026-10"
 redirect_urls = [ ]
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true

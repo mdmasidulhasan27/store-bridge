@@ -1,0 +1,36 @@
+// Production schema for Google Cloud Run.
+//
+// The Dockerfile copies this over `schema.prisma` at image build time so that
+// production talks to Cloud SQL for PostgreSQL, while local development keeps
+// using the SQLite datasource in `schema.prisma`.
+//
+// Keep this file in sync with `schema.prisma` - only the datasource differs.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}

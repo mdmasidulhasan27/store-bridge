@@ -35,7 +35,7 @@ export default function App() {
           A tagline about [your app] that describes your value proposition.
         </p>
         {showForm && (
-          <Form className={styles.form} method="post">
+          <Form className={styles.form} method="post" action="?index">
             <label className={styles.label}>
               <span>Shop domain</span>
               <input className={styles.input} type="text" name="shop" />
